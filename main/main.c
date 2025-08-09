@@ -1,6 +1,6 @@
 /*
- * ESP32-C6 Fragmented I2C Packet Handler
- * Handles I2C packet fragmentation and reassembly
+ * ESP32-C6 Speed-Optimized I2C Firmware Update
+ * Reduced logging and faster timing for improved performance
  */
 
 #include <stdio.h>
@@ -19,6 +19,10 @@
 
 static const char* TAG = "FW_UPDATE";
 
+// Debug logging control - set to 0 for speed optimization
+#define DEBUG_I2C_VERBOSE 0
+#define DEBUG_CHUNK_DETAILS 0
+
 // Global state
 static fw_state_t g_state = STATE_IDLE;
 static esp_ota_handle_t g_ota_handle = 0;
@@ -27,7 +31,7 @@ static fw_header_t g_fw_header;
 static uint32_t g_bytes_received = 0;
 static uint16_t g_expected_chunk = 0;
 
-// I2C Configuration
+// I2C Configuration - optimized for speed
 #define I2C_SLAVE_NUM           I2C_NUM_0
 #define I2C_SLAVE_SDA_IO        GPIO_NUM_6
 #define I2C_SLAVE_SCL_IO        GPIO_NUM_7
@@ -40,7 +44,7 @@ static size_t g_packet_buffer_len = 0;
 static TickType_t g_last_fragment_time = 0;
 #define FRAGMENT_TIMEOUT_MS     1000
 
-// Initialize I2C slave
+// Initialize I2C slave with optimized settings
 esp_err_t i2c_slave_init(void) {
     i2c_config_t conf_slave = {
         .sda_io_num = I2C_SLAVE_SDA_IO,
@@ -58,7 +62,7 @@ esp_err_t i2c_slave_init(void) {
                              I2C_SLAVE_RX_BUF_LEN, I2C_SLAVE_TX_BUF_LEN, 0);
 }
 
-// Send response
+// Send response - minimal logging for speed
 static void send_response(fw_status_t status, uint8_t seq, const void* data, uint16_t data_len) {
     uint8_t tx_buffer[I2C_SLAVE_TX_BUF_LEN];
     fw_response_t* resp = (fw_response_t*)tx_buffer;
@@ -75,37 +79,18 @@ static void send_response(fw_status_t status, uint8_t seq, const void* data, uin
 
     size_t response_size = sizeof(fw_response_t) + data_len;
 
-    ESP_LOGI(TAG, "Sending response: status=0x%02X, seq=%d, len=%d", status, seq, data_len);
+    // Reduced logging - only log errors and important responses
+    if (status != STATUS_OK || data_len > 0) {
+        ESP_LOGI(TAG, "Response: status=0x%02X, seq=%d, len=%d", status, seq, data_len);
+    }
 
-    int tx_len = i2c_slave_write_buffer(I2C_SLAVE_NUM, tx_buffer, response_size, pdMS_TO_TICKS(1000));
+    int tx_len = i2c_slave_write_buffer(I2C_SLAVE_NUM, tx_buffer, response_size, pdMS_TO_TICKS(500));
     if (tx_len <= 0) {
-        ESP_LOGW(TAG, "Failed to send response");
+        ESP_LOGW(TAG, "TX failed");
     }
 }
 
 // Handle GET_INFO command
-/*static void handle_get_info(uint8_t seq) {
-    device_info_t info = {0};
-
-    strncpy(info.device_name, "ESP32C6-FW", sizeof(info.device_name) - 1);
-
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
-    info.device_id = 0xC6010000 | (chip_info.revision << 8);
-    info.current_version = 0x010203;
-
-    uint32_t flash_size = 0;
-    esp_flash_get_size(NULL, &flash_size);
-    info.flash_size = flash_size;
-    info.hw_version = chip_info.revision;
-
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    info.boot_partition = (running && running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) ? 1 : 0;
-    info.max_chunk_size = MAX_CHUNK_SIZE;
-
-    send_response(STATUS_OK, seq, &info, sizeof(info));
-    ESP_LOGI(TAG, "Device info requested");
-}*/
 static void handle_get_info(uint8_t seq) {
     device_info_enhanced_t info = {0};
 
@@ -123,26 +108,24 @@ static void handle_get_info(uint8_t seq) {
 
     // Get detailed partition information
     const esp_partition_t* running = esp_ota_get_running_partition();
-    const esp_partition_t* factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
     const esp_partition_t* ota_0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
     const esp_partition_t* ota_1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
 
-    // Determine current partition type and label
     if (running) {
         strncpy(info.current_partition_label, running->label, sizeof(info.current_partition_label) - 1);
 
         switch (running->subtype) {
             case ESP_PARTITION_SUBTYPE_APP_FACTORY:
                 info.current_partition_type = 0;
-                info.boot_partition = 0; // Factory = A
+                info.boot_partition = 0;
                 break;
             case ESP_PARTITION_SUBTYPE_APP_OTA_0:
                 info.current_partition_type = 1;
-                info.boot_partition = 0; // ota_0 = A
+                info.boot_partition = 0;
                 break;
             case ESP_PARTITION_SUBTYPE_APP_OTA_1:
                 info.current_partition_type = 2;
-                info.boot_partition = 1; // ota_1 = B
+                info.boot_partition = 1;
                 break;
             default:
                 info.current_partition_type = 0xFF;
@@ -155,59 +138,50 @@ static void handle_get_info(uint8_t seq) {
     esp_ota_img_states_t ota_state;
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         switch (ota_state) {
-            case ESP_OTA_IMG_NEW:           info.ota_state = 1; break; // Pending
-            case ESP_OTA_IMG_PENDING_VERIFY: info.ota_state = 1; break; // Pending
-            case ESP_OTA_IMG_VALID:         info.ota_state = 2; break; // Valid
-            case ESP_OTA_IMG_INVALID:       info.ota_state = 3; break; // Invalid
-            default:                        info.ota_state = 0; break; // No OTA
+            case ESP_OTA_IMG_NEW:           info.ota_state = 1; break;
+            case ESP_OTA_IMG_PENDING_VERIFY: info.ota_state = 1; break;
+            case ESP_OTA_IMG_VALID:         info.ota_state = 2; break;
+            case ESP_OTA_IMG_INVALID:       info.ota_state = 3; break;
+            default:                        info.ota_state = 0; break;
         }
     } else {
-        info.ota_state = 0; // No OTA or factory
+        info.ota_state = 0;
     }
 
-    // Set partition versions (simplified - you can enhance this)
-    info.factory_version = 0x010200;  // Factory version
+    // Set partition versions
+    info.factory_version = 0x010200;
     info.ota_0_version = (ota_0 && running && running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) ? 0x010203 : 0;
     info.ota_1_version = (ota_1 && running && running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) ? 0x010203 : 0;
-
     info.max_chunk_size = MAX_CHUNK_SIZE;
 
     send_response(STATUS_OK, seq, &info, sizeof(info));
-
-    ESP_LOGI(TAG, "Device info requested - Running: %s (type=%d, state=%d)",
-             info.current_partition_label, info.current_partition_type, info.ota_state);
+    ESP_LOGI(TAG, "Device info: %s", info.current_partition_label);
 }
 
 // Handle START_UPDATE command
 static void handle_start_update(const fw_packet_t* packet) {
-    ESP_LOGI(TAG, "Start update: packet len=%d, expected=%d", packet->len, sizeof(fw_header_t));
-
     if (packet->len != sizeof(fw_header_t)) {
-        ESP_LOGW(TAG, "Invalid header size: got %d, expected %d", packet->len, sizeof(fw_header_t));
         send_response(STATUS_SIZE_ERROR, packet->seq, NULL, 0);
         return;
     }
 
     memcpy(&g_fw_header, packet->data, sizeof(fw_header_t));
 
-    ESP_LOGI(TAG, "Firmware header: magic=0x%08X, size=%d, crc=0x%08X",
-             g_fw_header.magic, g_fw_header.size, g_fw_header.crc32);
-
     if (g_fw_header.magic != 0xDEADBEEF) {
-        ESP_LOGE(TAG, "Invalid firmware magic: 0x%08X", g_fw_header.magic);
+        ESP_LOGE(TAG, "Invalid magic: 0x%08X", g_fw_header.magic);
         send_response(STATUS_ERROR, packet->seq, NULL, 0);
         return;
     }
 
     if (g_fw_header.size > (1024 * 1024) || g_fw_header.size == 0) {
-        ESP_LOGE(TAG, "Invalid firmware size: %d bytes", g_fw_header.size);
+        ESP_LOGE(TAG, "Invalid size: %d", g_fw_header.size);
         send_response(STATUS_SIZE_ERROR, packet->seq, NULL, 0);
         return;
     }
 
     g_update_partition = esp_ota_get_next_update_partition(NULL);
     if (!g_update_partition) {
-        ESP_LOGE(TAG, "No OTA partition available");
+        ESP_LOGE(TAG, "No OTA partition");
         send_response(STATUS_ERROR, packet->seq, NULL, 0);
         return;
     }
@@ -224,10 +198,10 @@ static void handle_start_update(const fw_packet_t* packet) {
     g_expected_chunk = 0;
 
     send_response(STATUS_OK, packet->seq, NULL, 0);
-    ESP_LOGI(TAG, "Update started successfully, size: %d bytes", g_fw_header.size);
+    ESP_LOGI(TAG, "Update started: %d bytes → %s", g_fw_header.size, g_update_partition->label);
 }
 
-// Handle SEND_CHUNK command
+// Handle SEND_CHUNK command - optimized for speed
 static void handle_send_chunk(const fw_packet_t* packet) {
     if (g_state != STATE_UPDATE_STARTED && g_state != STATE_RECEIVING_CHUNKS) {
         send_response(STATUS_ERROR, packet->seq, NULL, 0);
@@ -242,7 +216,7 @@ static void handle_send_chunk(const fw_packet_t* packet) {
     fw_chunk_t* chunk = (fw_chunk_t*)packet->data;
 
     if (chunk->chunk_id != g_expected_chunk) {
-        ESP_LOGW(TAG, "Chunk sequence error: expected %d, got %d", g_expected_chunk, chunk->chunk_id);
+        ESP_LOGW(TAG, "Chunk seq error: exp %d, got %d", g_expected_chunk, chunk->chunk_id);
         send_response(STATUS_ERROR, packet->seq, NULL, 0);
         return;
     }
@@ -254,7 +228,7 @@ static void handle_send_chunk(const fw_packet_t* packet) {
 
     uint32_t calc_crc = calculate_crc32(chunk->chunk_data, chunk->chunk_size);
     if (calc_crc != chunk->chunk_crc) {
-        ESP_LOGW(TAG, "Chunk CRC error: expected 0x%08X, got 0x%08X", chunk->chunk_crc, calc_crc);
+        ESP_LOGW(TAG, "CRC error: exp 0x%08X, got 0x%08X", chunk->chunk_crc, calc_crc);
         send_response(STATUS_CRC_ERROR, packet->seq, NULL, 0);
         return;
     }
@@ -272,10 +246,12 @@ static void handle_send_chunk(const fw_packet_t* packet) {
 
     send_response(STATUS_OK, packet->seq, NULL, 0);
 
-    if (g_expected_chunk % 10 == 0) {
-        ESP_LOGI(TAG, "Progress: %d/%d bytes (%.1f%%)",
+    // Progress logging - only every 100 chunks for speed
+    if (g_expected_chunk % 100 == 0) {
+        ESP_LOGI(TAG, "Progress: %d/%d (%.1f%%) - %d chunks",
                  g_bytes_received, g_fw_header.size,
-                 (float)g_bytes_received / g_fw_header.size * 100.0f);
+                 (float)g_bytes_received / g_fw_header.size * 100.0f,
+                 g_expected_chunk);
     }
 }
 
@@ -297,7 +273,7 @@ static void handle_simple_command(const fw_packet_t* packet) {
                 return;
             }
             if (g_bytes_received != g_fw_header.size) {
-                ESP_LOGE(TAG, "Size mismatch: expected %d, received %d", g_fw_header.size, g_bytes_received);
+                ESP_LOGE(TAG, "Size mismatch: %d/%d", g_bytes_received, g_fw_header.size);
                 send_response(STATUS_SIZE_ERROR, packet->seq, NULL, 0);
                 return;
             }
@@ -312,7 +288,7 @@ static void handle_simple_command(const fw_packet_t* packet) {
             g_ota_handle = 0;
             g_state = STATE_READY_TO_ACTIVATE;
             send_response(STATUS_OK, packet->seq, NULL, 0);
-            ESP_LOGI(TAG, "Firmware update completed successfully");
+            ESP_LOGI(TAG, "Update completed successfully");
             break;
 
         case CMD_ACTIVATE_FW:
@@ -330,7 +306,7 @@ static void handle_simple_command(const fw_packet_t* packet) {
 
             send_response(STATUS_OK, packet->seq, NULL, 0);
             ESP_LOGI(TAG, "Firmware activated, restarting...");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(500));  // Reduced delay
             esp_restart();
             break;
 
@@ -347,7 +323,7 @@ static void handle_simple_command(const fw_packet_t* packet) {
         case CMD_RESET_DEVICE:
             send_response(STATUS_OK, packet->seq, NULL, 0);
             ESP_LOGI(TAG, "Reset requested");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(500));  // Reduced delay
             esp_restart();
             break;
 
@@ -370,12 +346,11 @@ static bool is_complete_packet(const uint8_t* buffer, size_t len) {
     return len >= expected_len;
 }
 
-// Process fragmented data
-// Enhanced packet validation - replace process_fragment() in main.c
+// Speed-optimized fragment processing
 static void process_fragment(const uint8_t* data, size_t len) {
     TickType_t current_time = xTaskGetTickCount();
 
-    // Check for timeout (new packet started)
+    // Check for timeout
     if (g_packet_buffer_len > 0 &&
         (current_time - g_last_fragment_time) > pdMS_TO_TICKS(FRAGMENT_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "Fragment timeout, discarding %d bytes", g_packet_buffer_len);
@@ -387,34 +362,30 @@ static void process_fragment(const uint8_t* data, size_t len) {
         const fw_packet_t* potential_packet = (const fw_packet_t*)data;
         size_t expected_complete_len = sizeof(fw_packet_t) + potential_packet->len;
 
-        // Strict validation criteria for direct packet processing
         bool is_valid_direct_packet =
             (len >= expected_complete_len) &&
             (potential_packet->cmd >= CMD_GET_INFO && potential_packet->cmd <= CMD_RESET_DEVICE) &&
-            (potential_packet->len <= 200) &&  // Reasonable length limit
-            (expected_complete_len <= len) &&  // Complete packet received
+            (potential_packet->len <= 200) &&
             (
-                // Only allow certain commands to be processed directly during update
-                (g_state == STATE_IDLE) ||  // Allow any command when idle
-                (potential_packet->cmd == CMD_GET_INFO) ||  // Always allow info
-                (potential_packet->cmd == CMD_GET_STATUS) ||  // Always allow status
-                (potential_packet->cmd == CMD_SEND_CHUNK && g_state >= STATE_UPDATE_STARTED) ||  // Chunks during update
-                (potential_packet->cmd == CMD_FINISH_UPDATE && g_state == STATE_RECEIVING_CHUNKS) ||  // Finish when receiving
-                (potential_packet->cmd == CMD_ACTIVATE_FW && g_state == STATE_READY_TO_ACTIVATE) ||  // Activate when ready
-                (potential_packet->cmd == CMD_ABORT_UPDATE && g_state >= STATE_UPDATE_STARTED)  // Abort only if explicitly sent
+                (g_state == STATE_IDLE) ||
+                (potential_packet->cmd == CMD_GET_INFO) ||
+                (potential_packet->cmd == CMD_GET_STATUS) ||
+                (potential_packet->cmd == CMD_SEND_CHUNK && g_state >= STATE_UPDATE_STARTED) ||
+                (potential_packet->cmd == CMD_FINISH_UPDATE && g_state == STATE_RECEIVING_CHUNKS) ||
+                (potential_packet->cmd == CMD_ACTIVATE_FW && g_state == STATE_READY_TO_ACTIVATE) ||
+                (potential_packet->cmd == CMD_ABORT_UPDATE && g_state >= STATE_UPDATE_STARTED)
             );
 
         if (is_valid_direct_packet) {
-            ESP_LOGI(TAG, "Complete packet received directly: cmd=0x%02X, seq=%d, len=%d",
-                     potential_packet->cmd, potential_packet->seq, potential_packet->len);
+            #if DEBUG_I2C_VERBOSE
+                ESP_LOGI(TAG, "Direct packet: cmd=0x%02X, seq=%d", potential_packet->cmd, potential_packet->seq);
+            #endif
 
-            // Clear any existing fragment buffer - new complete packet takes priority
             if (g_packet_buffer_len > 0) {
-                ESP_LOGW(TAG, "Discarding %d fragment bytes for new complete packet", g_packet_buffer_len);
+                ESP_LOGW(TAG, "Discarding %d fragment bytes", g_packet_buffer_len);
                 g_packet_buffer_len = 0;
             }
 
-            // Process the complete packet immediately
             switch (potential_packet->cmd) {
                 case CMD_GET_INFO:
                     handle_get_info(potential_packet->seq);
@@ -429,30 +400,23 @@ static void process_fragment(const uint8_t* data, size_t len) {
                     handle_simple_command(potential_packet);
                     break;
             }
-            return; // Exit early - don't add to fragment buffer
-        } else {
-            // Log why packet was rejected (for debugging)
-            if (len >= expected_complete_len &&
-                potential_packet->cmd >= CMD_GET_INFO && potential_packet->cmd <= CMD_RESET_DEVICE) {
-                ESP_LOGD(TAG, "Packet rejected due to state: cmd=0x%02X, state=%d",
-                         potential_packet->cmd, g_state);
-            }
+            return;
         }
     }
 
-    // Handle fragmented packets (only if not a complete packet above)
+    // Handle fragmented packets
     if (g_packet_buffer_len + len <= sizeof(g_packet_buffer)) {
         memcpy(g_packet_buffer + g_packet_buffer_len, data, len);
         g_packet_buffer_len += len;
         g_last_fragment_time = current_time;
 
-        ESP_LOGI(TAG, "Fragment: added %d bytes, total %d bytes", len, g_packet_buffer_len);
+        #if DEBUG_I2C_VERBOSE
+            ESP_LOGI(TAG, "Fragment: +%d = %d bytes", len, g_packet_buffer_len);
+        #endif
 
-        // Check if we have a complete packet in the buffer
         if (is_complete_packet(g_packet_buffer, g_packet_buffer_len)) {
             const fw_packet_t* packet = (const fw_packet_t*)g_packet_buffer;
 
-            // Apply same strict validation for assembled packets
             bool is_valid_assembled_packet =
                 (packet->cmd >= CMD_GET_INFO && packet->cmd <= CMD_RESET_DEVICE) &&
                 (packet->len <= 200) &&
@@ -467,10 +431,10 @@ static void process_fragment(const uint8_t* data, size_t len) {
                 );
 
             if (is_valid_assembled_packet) {
-                ESP_LOGI(TAG, "Complete packet assembled: cmd=0x%02X, seq=%d, len=%d",
-                         packet->cmd, packet->seq, packet->len);
+                #if DEBUG_I2C_VERBOSE
+                    ESP_LOGI(TAG, "Assembled packet: cmd=0x%02X, seq=%d", packet->cmd, packet->seq);
+                #endif
 
-                // Process the complete packet
                 switch (packet->cmd) {
                     case CMD_GET_INFO:
                         handle_get_info(packet->seq);
@@ -486,53 +450,50 @@ static void process_fragment(const uint8_t* data, size_t len) {
                         break;
                 }
             } else {
-                ESP_LOGW(TAG, "Invalid command in assembled packet: cmd=0x%02X, state=%d, discarding",
-                         packet->cmd, g_state);
+                ESP_LOGW(TAG, "Invalid assembled packet: cmd=0x%02X, state=%d", packet->cmd, g_state);
             }
 
-            // Always clear buffer after processing or invalid packet
             g_packet_buffer_len = 0;
         }
     } else {
-        ESP_LOGW(TAG, "Fragment buffer overflow, discarding all (%d + %d bytes)", g_packet_buffer_len, len);
+        ESP_LOGW(TAG, "Buffer overflow, discarding %d+%d bytes", g_packet_buffer_len, len);
         g_packet_buffer_len = 0;
     }
 }
 
-// I2C communication task
+// Speed-optimized I2C task
 static void i2c_task(void* arg) {
     uint8_t rx_buffer[I2C_SLAVE_RX_BUF_LEN];
 
-    ESP_LOGI(TAG, "I2C communication task started");
+    ESP_LOGI(TAG, "I2C task started (speed optimized)");
 
-    // Initialize fragment buffer
     g_packet_buffer_len = 0;
     g_last_fragment_time = 0;
 
     while (1) {
         memset(rx_buffer, 0, sizeof(rx_buffer));
 
-        int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, rx_buffer, sizeof(rx_buffer), pdMS_TO_TICKS(100));
+        // Reduced timeout for faster polling
+        int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, rx_buffer, sizeof(rx_buffer), pdMS_TO_TICKS(30));
 
         if (len > 0) {
-            ESP_LOGI(TAG, "Received %d bytes", len);
-            ESP_LOGI(TAG, "RX[0-7]: %02X %02X %02X %02X %02X %02X %02X %02X",
-                     rx_buffer[0], rx_buffer[1], rx_buffer[2], rx_buffer[3],
-                     rx_buffer[4], rx_buffer[5], rx_buffer[6], rx_buffer[7]);
+            #if DEBUG_I2C_VERBOSE
+                ESP_LOGD(TAG, "RX: %d bytes", len);
+            #endif
 
-            // Handle as fragment
             process_fragment(rx_buffer, len);
         } else if (len < 0) {
-            ESP_LOGW(TAG, "I2C read error: %d", len);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGW(TAG, "I2C error: %d", len);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Reduced task delay for faster response
+        vTaskDelay(pdMS_TO_TICKS(2));  // Much faster polling
     }
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32-C6 Firmware Update Slave Starting (Fragmented I2C)");
+    ESP_LOGI(TAG, "ESP32-C6 Firmware Update Slave Starting (Speed Optimized)");
 
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
@@ -545,24 +506,23 @@ void app_main(void) {
 
     esp_err_t err = i2c_slave_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C slave init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(err));
         return;
     }
 
-    BaseType_t ret = xTaskCreate(i2c_task, "i2c_task", 4096, NULL, 5, NULL);
+    BaseType_t ret = xTaskCreate(i2c_task, "i2c_task", 4096, NULL, 6, NULL);  // Higher priority
     if (ret != pdTRUE) {
         ESP_LOGE(TAG, "Failed to create I2C task");
         return;
     }
 
-    ESP_LOGI(TAG, "Firmware Update Slave Ready (Address: 0x%02X, SDA: GPIO%d, SCL: GPIO%d)",
+    ESP_LOGI(TAG, "Ready (Address: 0x%02X, SDA: GPIO%d, SCL: GPIO%d)",
              ESP32_I2C_ADDR, I2C_SLAVE_SDA_IO, I2C_SLAVE_SCL_IO);
 
     const esp_partition_t* running = esp_ota_get_running_partition();
-    ESP_LOGI(TAG, "Running partition: %s", running ? running->label : "unknown");
+    ESP_LOGI(TAG, "Running: %s", running ? running->label : "unknown");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGD(TAG, "Firmware update slave running, state: %d", g_state);
     }
 }
