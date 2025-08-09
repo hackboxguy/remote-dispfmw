@@ -15,7 +15,7 @@
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
-#include "i2c_fw_update.h"
+#include "remote-dispfmw.h"
 
 static const char* TAG = "FW_UPDATE";
 
