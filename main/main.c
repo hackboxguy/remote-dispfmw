@@ -371,6 +371,7 @@ static bool is_complete_packet(const uint8_t* buffer, size_t len) {
 }
 
 // Process fragmented data
+// Enhanced packet validation - replace process_fragment() in main.c
 static void process_fragment(const uint8_t* data, size_t len) {
     TickType_t current_time = xTaskGetTickCount();
 
@@ -381,7 +382,65 @@ static void process_fragment(const uint8_t* data, size_t len) {
         g_packet_buffer_len = 0;
     }
 
-    // Add new data to buffer
+    // Enhanced validation for complete packets
+    if (len >= sizeof(fw_packet_t)) {
+        const fw_packet_t* potential_packet = (const fw_packet_t*)data;
+        size_t expected_complete_len = sizeof(fw_packet_t) + potential_packet->len;
+
+        // Strict validation criteria for direct packet processing
+        bool is_valid_direct_packet =
+            (len >= expected_complete_len) &&
+            (potential_packet->cmd >= CMD_GET_INFO && potential_packet->cmd <= CMD_RESET_DEVICE) &&
+            (potential_packet->len <= 200) &&  // Reasonable length limit
+            (expected_complete_len <= len) &&  // Complete packet received
+            (
+                // Only allow certain commands to be processed directly during update
+                (g_state == STATE_IDLE) ||  // Allow any command when idle
+                (potential_packet->cmd == CMD_GET_INFO) ||  // Always allow info
+                (potential_packet->cmd == CMD_GET_STATUS) ||  // Always allow status
+                (potential_packet->cmd == CMD_SEND_CHUNK && g_state >= STATE_UPDATE_STARTED) ||  // Chunks during update
+                (potential_packet->cmd == CMD_FINISH_UPDATE && g_state == STATE_RECEIVING_CHUNKS) ||  // Finish when receiving
+                (potential_packet->cmd == CMD_ACTIVATE_FW && g_state == STATE_READY_TO_ACTIVATE) ||  // Activate when ready
+                (potential_packet->cmd == CMD_ABORT_UPDATE && g_state >= STATE_UPDATE_STARTED)  // Abort only if explicitly sent
+            );
+
+        if (is_valid_direct_packet) {
+            ESP_LOGI(TAG, "Complete packet received directly: cmd=0x%02X, seq=%d, len=%d",
+                     potential_packet->cmd, potential_packet->seq, potential_packet->len);
+
+            // Clear any existing fragment buffer - new complete packet takes priority
+            if (g_packet_buffer_len > 0) {
+                ESP_LOGW(TAG, "Discarding %d fragment bytes for new complete packet", g_packet_buffer_len);
+                g_packet_buffer_len = 0;
+            }
+
+            // Process the complete packet immediately
+            switch (potential_packet->cmd) {
+                case CMD_GET_INFO:
+                    handle_get_info(potential_packet->seq);
+                    break;
+                case CMD_START_UPDATE:
+                    handle_start_update(potential_packet);
+                    break;
+                case CMD_SEND_CHUNK:
+                    handle_send_chunk(potential_packet);
+                    break;
+                default:
+                    handle_simple_command(potential_packet);
+                    break;
+            }
+            return; // Exit early - don't add to fragment buffer
+        } else {
+            // Log why packet was rejected (for debugging)
+            if (len >= expected_complete_len &&
+                potential_packet->cmd >= CMD_GET_INFO && potential_packet->cmd <= CMD_RESET_DEVICE) {
+                ESP_LOGD(TAG, "Packet rejected due to state: cmd=0x%02X, state=%d",
+                         potential_packet->cmd, g_state);
+            }
+        }
+    }
+
+    // Handle fragmented packets (only if not a complete packet above)
     if (g_packet_buffer_len + len <= sizeof(g_packet_buffer)) {
         memcpy(g_packet_buffer + g_packet_buffer_len, data, len);
         g_packet_buffer_len += len;
@@ -389,38 +448,53 @@ static void process_fragment(const uint8_t* data, size_t len) {
 
         ESP_LOGI(TAG, "Fragment: added %d bytes, total %d bytes", len, g_packet_buffer_len);
 
-        // Check if we have a complete packet
+        // Check if we have a complete packet in the buffer
         if (is_complete_packet(g_packet_buffer, g_packet_buffer_len)) {
             const fw_packet_t* packet = (const fw_packet_t*)g_packet_buffer;
-            size_t packet_len = sizeof(fw_packet_t) + packet->len;
 
-            ESP_LOGI(TAG, "Complete packet assembled: cmd=0x%02X, seq=%d, len=%d",
-                     packet->cmd, packet->seq, packet->len);
+            // Apply same strict validation for assembled packets
+            bool is_valid_assembled_packet =
+                (packet->cmd >= CMD_GET_INFO && packet->cmd <= CMD_RESET_DEVICE) &&
+                (packet->len <= 200) &&
+                (
+                    (g_state == STATE_IDLE) ||
+                    (packet->cmd == CMD_GET_INFO) ||
+                    (packet->cmd == CMD_GET_STATUS) ||
+                    (packet->cmd == CMD_SEND_CHUNK && g_state >= STATE_UPDATE_STARTED) ||
+                    (packet->cmd == CMD_FINISH_UPDATE && g_state == STATE_RECEIVING_CHUNKS) ||
+                    (packet->cmd == CMD_ACTIVATE_FW && g_state == STATE_READY_TO_ACTIVATE) ||
+                    (packet->cmd == CMD_ABORT_UPDATE && g_state >= STATE_UPDATE_STARTED)
+                );
 
-            // Process the complete packet
-            switch (packet->cmd) {
-                case CMD_GET_INFO:
-                    handle_get_info(packet->seq);
-                    break;
+            if (is_valid_assembled_packet) {
+                ESP_LOGI(TAG, "Complete packet assembled: cmd=0x%02X, seq=%d, len=%d",
+                         packet->cmd, packet->seq, packet->len);
 
-                case CMD_START_UPDATE:
-                    handle_start_update(packet);
-                    break;
-
-                case CMD_SEND_CHUNK:
-                    handle_send_chunk(packet);
-                    break;
-
-                default:
-                    handle_simple_command(packet);
-                    break;
+                // Process the complete packet
+                switch (packet->cmd) {
+                    case CMD_GET_INFO:
+                        handle_get_info(packet->seq);
+                        break;
+                    case CMD_START_UPDATE:
+                        handle_start_update(packet);
+                        break;
+                    case CMD_SEND_CHUNK:
+                        handle_send_chunk(packet);
+                        break;
+                    default:
+                        handle_simple_command(packet);
+                        break;
+                }
+            } else {
+                ESP_LOGW(TAG, "Invalid command in assembled packet: cmd=0x%02X, state=%d, discarding",
+                         packet->cmd, g_state);
             }
 
-            // Clear buffer
+            // Always clear buffer after processing or invalid packet
             g_packet_buffer_len = 0;
         }
     } else {
-        ESP_LOGW(TAG, "Fragment buffer overflow, discarding");
+        ESP_LOGW(TAG, "Fragment buffer overflow, discarding all (%d + %d bytes)", g_packet_buffer_len, len);
         g_packet_buffer_len = 0;
     }
 }
